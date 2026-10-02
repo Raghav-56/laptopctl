@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+
+svc_state() {
+    systemctl is-active "$1" 2>/dev/null || true
+}
+
+battery_status() {
+    found=0
+    for battery in /sys/class/power_supply/*; do
+        [ -r "$battery/type" ] || continue
+        [ "$(cat "$battery/type" 2>/dev/null)" = "Battery" ] || continue
+        found=1
+        name=$(basename "$battery")
+        capacity=$(cat "$battery/capacity" 2>/dev/null || echo "?")
+        status=$(cat "$battery/status" 2>/dev/null || true)
+        if [ -n "$status" ]; then
+            printf '%s: %s%% (%s)\n' "$name" "$capacity" "$status"
+        else
+            printf '%s: %s%%\n' "$name" "$capacity"
+        fi
+    done
+    [ "$found" -eq 1 ] || echo "unavailable"
+}
+
+power_source() {
+    battery_found=0
+    external_found=0
+    external_type=""
+    for supply in /sys/class/power_supply/*; do
+        [ -r "$supply/type" ] || continue
+        supply_type=$(cat "$supply/type" 2>/dev/null)
+        case "$supply_type" in
+            Battery) battery_found=1 ;;
+            Mains|USB|USB_C)
+                if [ "$(cat "$supply/online" 2>/dev/null)" = "1" ]; then
+                    external_found=1
+                    [ "$supply_type" = "Mains" ] && external_type="AC" || external_type="External power"
+                fi
+                ;;
+        esac
+    done
+    if [ "$external_found" -eq 1 ]; then
+        echo "$external_type connected"
+    elif [ "$battery_found" -eq 1 ]; then
+        echo "Battery"
+    else
+        echo "unavailable"
+    fi
+}
+
+disk_status() {
+    df -hP / 2>/dev/null | awk 'NR == 2 { printf "%s used / %s, %s free (%s)\n", $3, $2, $4, $5; found=1 } END { if (!found) print "unavailable" }'
+}
+
+uptime_status() {
+    uptime_text=$(uptime -p 2>/dev/null || echo "unavailable")
+    load_text=$(awk '{ printf "%s, %s, %s", $1, $2, $3 }' /proc/loadavg 2>/dev/null)
+    if [ -n "$load_text" ]; then
+        printf "%s | load %s\n" "$uptime_text" "$load_text"
+    else
+        printf "%s\n" "$uptime_text"
+    fi
+}
+
+thermal_status() {
+    found=0
+    for zone in /sys/class/thermal/thermal_zone*; do
+        [ -r "$zone/type" ] && [ -r "$zone/temp" ] || continue
+        zone_type=$(cat "$zone/type" 2>/dev/null)
+        zone_temp=$(cat "$zone/temp" 2>/dev/null)
+        [[ "$zone_temp" =~ ^-?[0-9]+$ ]] || continue
+        [ "$found" -eq 0 ] || printf '; '
+        printf '%s %s' "$zone_type" "$(awk -v temp="$zone_temp" 'BEGIN { printf "%.1f°C", temp / 1000 }')"
+        found=1
+    done
+    if [ "$found" -eq 1 ]; then
+        echo
+    else
+        echo "unavailable"
+    fi
+}
+
+show_all_status() {
+    echo "=== GUI ==="
+    printf "LightDM:      %s\n" "$(svc_state lightdm)"
+    printf "Default boot: %s\n" "$(systemctl get-default)"
+
+    echo
+    echo "=== RDP ==="
+    printf "xrdp:         %s\n" "$(svc_state xrdp)"
+    printf "xrdp-sesman:  %s\n" "$(svc_state xrdp-sesman)"
+
+    echo
+    echo "RDP/Xfce processes:"
+    ps -eo pid,user,cmd |
+        grep -E 'Xorg.*xrdp|xrdp-chansrv|xfce4-session' |
+        grep -v grep || echo "none"
+
+    echo
+    echo "=== Lid ==="
+    cat /proc/acpi/button/lid/*/state 2>/dev/null || echo "unknown"
+
+    echo
+    echo "=== Battery ==="
+    battery_status
+    printf "Power source: %s\n" "$(power_source)"
+
+    echo
+    echo "=== System ==="
+    printf "Uptime/load: %s\n" "$(uptime_status)"
+    printf "Root disk:   %s\n" "$(disk_status)"
+    printf "Temperatures: %s\n" "$(thermal_status)"
+
+    echo
+    echo "=== Backlight ==="
+    for b in /sys/class/backlight/*; do
+        [ -d "$b" ] || continue
+
+        power=$(cat "$b/bl_power" 2>/dev/null || echo "?")
+        brightness=$(cat "$b/brightness" 2>/dev/null || echo "?")
+        max=$(cat "$b/max_brightness" 2>/dev/null || echo "?")
+
+        case "$power" in
+            0) state="ON" ;;
+            4) state="OFF" ;;
+            *) state="UNKNOWN" ;;
+        esac
+
+        printf "%s: %s | power=%s | brightness=%s/%s\n" \
+            "$(basename "$b")" "$state" "$power" "$brightness" "$max"
+    done
+
+    echo
+    echo "=== RAM ==="
+    free -h
+
+    echo
+    echo "=== Swap ==="
+    if command -v swapon >/dev/null 2>&1; then
+        swapon --show
+    elif [ -x /usr/sbin/swapon ]; then
+        /usr/sbin/swapon --show
+    elif [ -x /sbin/swapon ]; then
+        /sbin/swapon --show
+    elif [ -r /proc/swaps ]; then
+        cat /proc/swaps
+    else
+        echo "Swap information unavailable"
+    fi
+
+    echo
+    echo "=== Network ==="
+    nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null
+
+    echo
+    echo "=== Tailscale ==="
+    tailscale status --self 2>/dev/null || echo "unavailable"
+}
+
+show_status() {
+    printf "Boot:      %s\n" "$(systemctl get-default)"
+    printf "GUI:       %s\n" "$(svc_state lightdm)"
+    printf "RDP:       xrdp=%s, sesman=%s\n" \
+        "$(svc_state xrdp)" "$(svc_state xrdp-sesman)"
+
+    lid=$(cat /proc/acpi/button/lid/*/state 2>/dev/null || echo "unknown")
+    printf "Lid:       %s\n" "$lid"
+    printf "Battery:   %s\n" "$(battery_status | paste -sd ';' -)"
+    printf "Power:     %s\n" "$(power_source)"
+    printf "Disk:      %s\n" "$(disk_status)"
+    printf "Uptime:    %s\n" "$(uptime_status)"
+    printf "Temp:      %s\n" "$(thermal_status)"
+
+    found_backlight=0
+    for b in /sys/class/backlight/*; do
+        [ -d "$b" ] || continue
+        found_backlight=1
+        power=$(cat "$b/bl_power" 2>/dev/null || echo "?")
+        case "$power" in
+            0) state="ON" ;;
+            4) state="OFF" ;;
+            *) state="UNKNOWN" ;;
+        esac
+        printf "Backlight: %s %s\n" "$(basename "$b")" "$state"
+    done
+    [ "$found_backlight" -eq 1 ] || echo "Backlight: unavailable"
+
+    free -h | awk 'NR == 1 { next } NR == 2 { printf "RAM:       %s available / %s total\n", $7, $2 } NR == 3 { printf "Swap:      %s used / %s total\n", $3, $2 }'
+    if command -v nmcli >/dev/null 2>&1; then
+        printf "Network:   "
+        nmcli -t -f DEVICE,STATE device 2>/dev/null | awk -F: '$2 == "connected" { if (n++) printf ", "; printf "%s", $1 } END { if (!n) printf "no connected devices"; print "" }'
+    else
+        echo "Network:   unavailable"
+    fi
+}
+
+show_sessions() {
+    exclude_xrdp=${1:-}
+    [ "$exclude_xrdp" = "-x" ] && exclude_xrdp="--exclude-xrdp"
+    printf "ID  USER      SERVICE       TYPE  REMOTE  STATE\n"
+    found=0
+
+    for id in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        user=$(loginctl show-session "$id" -p Name --value)
+        service=$(loginctl show-session "$id" -p Service --value)
+        if [ "$exclude_xrdp" = "--exclude-xrdp" ] && [ "$service" = "xrdp-sesman" ]; then
+            continue
+        fi
+        type=$(loginctl show-session "$id" -p Type --value)
+        remote=$(loginctl show-session "$id" -p Remote --value)
+        state=$(loginctl show-session "$id" -p State --value)
+
+        found=1
+        printf "%-3s %-9s %-13s %-5s %-7s %s\n" \
+            "$id" "$user" "$service" "$type" "$remote" "$state"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        if [ "$exclude_xrdp" = "--exclude-xrdp" ]; then
+            echo "No non-XRDP sessions."
+        else
+            echo "No sessions."
+        fi
+    fi
+}
+
+show_help() {
+    cat <<'EOF'
+Usage:
+  laptopctl [status] [--all]
+  laptopctl --all
+  laptopctl g|gui {on|off|status}
+  laptopctl r|rdp {on|off|status}
+  laptopctl bl|backlight {on|off|status}
+  laptopctl b|boot {gui|headless|status}
+  laptopctl s|sessions [-x|--exclude-xrdp]
+  laptopctl k|kill SESSION_ID
+
+Status options:
+  status       Show the concise machine status (default)
+  --all        Show the full status, including processes and Tailscale
+
+Examples:
+  lstat
+  laptopctl --all
+  laptopctl r on
+  laptopctl s -x
+  laptopctl k 5
+
+Alias:
+  lstat        Same as laptopctl status
+  lstat --all  Same as laptopctl status --all
+EOF
+}
+
+usage_error() {
+    printf 'Error: %s\nUsage: %s\n' "$1" "$2" >&2
+    exit 2
+}
+
+run_action() {
+    description=$1
+    success=$2
+    shift 2
+
+    printf '%s...\n' "$description"
+    if "$@"; then
+        printf '%s\n' "$success"
+    else
+        result=$?
+        printf 'Failed: %s (exit %s).\n' "$description" "$result" >&2
+        return "$result"
+    fi
+}
+
+case "${1:-status}" in
+    status)
+        case "${2:-}" in
+            "") show_status ;;
+            --all)
+                [ "$#" -eq 2 ] || usage_error 'status takes no extra arguments' 'laptopctl status [--all]'
+                show_all_status
+                ;;
+            --help|-h)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl status --help'
+                show_help
+                ;;
+            *) usage_error "unknown status option: $2" 'laptopctl status [--all]' ;;
+        esac
+        ;;
+
+    --all)
+        [ "$#" -eq 1 ] || usage_error '--all takes no extra arguments' 'laptopctl --all'
+        show_all_status
+        ;;
+
+    --help|-h|help)
+        show_help
+        ;;
+
+    gui|g)
+        case "${2:-}" in
+            on)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui on'
+                run_action 'Starting the graphical desktop' 'Graphical desktop is on.' sudo systemctl start lightdm
+                ;;
+            off)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui off'
+                run_action 'Stopping the graphical desktop' 'Graphical desktop is off.' sudo systemctl stop lightdm
+                ;;
+            status)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui status'
+                systemctl status lightdm --no-pager
+                ;;
+            --help|-h) show_help ;;
+            *) usage_error "unknown GUI action: ${2:-<missing>}" 'laptopctl gui {on|off|status}' ;;
+        esac
+        ;;
+
+    rdp|r)
+        case "${2:-}" in
+            on)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp on'
+                run_action 'Starting the RDP server' 'RDP server is on.' sudo systemctl start xrdp-sesman xrdp
+                ;;
+            off)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp off'
+                run_action 'Stopping the RDP server' 'RDP server is off.' sudo systemctl stop xrdp xrdp-sesman
+                ;;
+            status)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp status'
+                systemctl status xrdp xrdp-sesman --no-pager
+                ;;
+            --help|-h) show_help ;;
+            *) usage_error "unknown RDP action: ${2:-<missing>}" 'laptopctl rdp {on|off|status}' ;;
+        esac
+        ;;
+
+    backlight|bl)
+        case "${2:-}" in
+            on)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl backlight on'
+                run_action 'Turning the backlight on' 'Backlight is on.' sudo sh -c '
+                    for b in /sys/class/backlight/*/bl_power; do
+                        [ -e "$b" ] && echo 0 > "$b"
+                    done
+                '
+                ;;
+            off)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl backlight off'
+                run_action 'Turning the backlight off' 'Backlight is off.' sudo sh -c '
+                    for b in /sys/class/backlight/*/bl_power; do
+                        [ -e "$b" ] && echo 4 > "$b"
+                    done
+                '
+                ;;
+            status)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl backlight status'
+                for b in /sys/class/backlight/*; do
+                    [ -d "$b" ] || continue
+                    echo "$(basename "$b"): power=$(cat "$b/bl_power") brightness=$(cat "$b/brightness")"
+                done
+                ;;
+            --help|-h) show_help ;;
+            *) usage_error "unknown backlight action: ${2:-<missing>}" 'laptopctl backlight {on|off|status}' ;;
+        esac
+        ;;
+
+    boot|b)
+        case "${2:-}" in
+            gui)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl boot gui'
+                run_action 'Setting GUI boot as the default' 'GUI boot is now the default.' sudo systemctl set-default graphical.target
+                ;;
+            headless)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl boot headless'
+                run_action 'Setting headless boot as the default' 'Headless boot is now the default.' sudo systemctl set-default multi-user.target
+                ;;
+            status)
+                [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl boot status'
+                systemctl get-default
+                ;;
+            --help|-h) show_help ;;
+            *) usage_error "unknown boot action: ${2:-<missing>}" 'laptopctl boot {gui|headless|status}' ;;
+        esac
+        ;;
+
+    sessions|s)
+        case "${2:-}" in
+            ""|--exclude-xrdp|-x) show_sessions "${2:-}" ;;
+            --help|-h) show_help ;;
+            *) usage_error "unknown sessions option: $2" 'laptopctl s|sessions [-x|--exclude-xrdp]' ;;
+        esac
+        ;;
+
+    kill-session|kill|k)
+        [ "$#" -eq 2 ] || usage_error 'provide exactly one session ID' 'laptopctl k|kill SESSION_ID'
+        [[ "$2" =~ ^[[:alnum:]_.-]+$ ]] || usage_error 'invalid session ID' 'laptopctl k|kill SESSION_ID'
+        run_action "Terminating session $2" "Session $2 terminated." sudo loginctl terminate-session "$2"
+        ;;
+
+    *)
+        usage_error "unknown command: $1" 'laptopctl [COMMAND] [OPTIONS] (try laptopctl --help)'
+        ;;
+esac
