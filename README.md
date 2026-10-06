@@ -20,6 +20,33 @@ install -Dm755 laptopctl ~/.local/bin/laptopctl
 
 Make sure `~/.local/bin` is on your `PATH`. Then run `laptopctl --help`.
 
+## Shell setup
+
+The `shell/` directory tracks the personal additions used on this laptop:
+
+- `shell/path.sh` adds the installed local, Bun, OpenCode, and system administration directories to `PATH`, without adding duplicates. It also sets `BUN_INSTALL` when Bun is installed. Bash and POSIX shells can source it.
+- `shell/bashrc.bash` loads that environment, defines `lstat`, and initializes zoxide when installed. It includes commented shortcuts for laptop controls and only runs in interactive Bash shells.
+
+With this checkout at `~/laptopctl`, add this at the end of `~/.bashrc`:
+
+```bash
+if [ -r "$HOME/laptopctl/shell/bashrc.bash" ]; then
+    . "$HOME/laptopctl/shell/bashrc.bash"
+fi
+```
+
+Add this at the end of `~/.profile` so login shells also get the tool paths:
+
+```sh
+if [ -r "$HOME/laptopctl/shell/path.sh" ]; then
+    . "$HOME/laptopctl/shell/path.sh"
+fi
+```
+
+Replace the existing personal PATH, Bun, OpenCode, `lstat`, and zoxide additions with these hooks. Keep the rest of your shell configuration. Adjust both hook paths if you move the checkout. Edit the tracked files to change these settings, then open a new shell or run `source ~/.bashrc`.
+
+The command in `~/.local/bin/laptopctl` is an installed copy. Rerun the install command after editing the CLI.
+
 ## Usage
 
 ```text
