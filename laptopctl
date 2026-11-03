@@ -235,6 +235,9 @@ Usage:
   laptopctl b|boot {gui|headless|status}
   laptopctl s|sessions [-x|--exclude-xrdp]
   laptopctl k|kill SESSION_ID
+  laptopctl storage [status [USER]]
+  laptopctl storage set USER SIZE
+  laptopctl storage remove USER
   laptopctl ram [status [USER]]
   laptopctl ram set USER RAM_CAP [--high SIZE] [--swap SIZE]
   laptopctl ram boost USER RAM_CAP [--high SIZE] [--swap SIZE] [--for 2h]
@@ -280,6 +283,15 @@ run_action() {
 }
 
 case "${1:-status}" in
+    storage|disk)
+        shift
+        if [ ! -x /usr/local/libexec/laptopctl-storage ]; then
+            printf 'Storage helper is not installed.\n' >&2
+            exit 1
+        fi
+        exec /usr/local/libexec/laptopctl-storage "$@"
+        ;;
+
     ram|memory)
         shift
         if [ ! -x /usr/local/libexec/laptopctl-ram ]; then

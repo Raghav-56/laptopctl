@@ -9,7 +9,8 @@ A small Bash command-line tool for checking and controlling common laptop servic
 - Common status utilities such as `awk`, `df`, `free`, `ps`, and `uptime`
 - Optional: `nmcli` and `tailscale` for network and Tailscale details
 - `sudo` for commands that change system state
-- Python 3 for RAM-cap commands
+- Python 3 for RAM and storage commands
+- Active Linux user quotas on the root filesystem for storage commands
 
 The status commands read information from systemd, `/proc`, and `/sys`. Control commands use `sudo` to start or stop services, change the default boot target, set backlight power, or terminate a login session. Review the script before running it, especially before using commands that change state.
 
@@ -18,6 +19,7 @@ The status commands read information from systemd, `/proc`, and `/sys`. Control 
 ```sh
 install -Dm755 laptopctl ~/.local/bin/laptopctl
 sudo install -Dm755 laptopctl-ram /usr/local/libexec/laptopctl-ram
+sudo install -Dm755 laptopctl-storage /usr/local/libexec/laptopctl-storage
 ```
 
 Make sure `~/.local/bin` is on your `PATH`. Then run `laptopctl --help`.
@@ -59,6 +61,9 @@ laptopctl backlight {on|off|status}
 laptopctl boot {gui|headless|status}
 laptopctl sessions [-x|--exclude-xrdp]
 laptopctl kill SESSION_ID
+laptopctl storage [status [USER]]
+laptopctl storage set USER SIZE
+laptopctl storage remove USER
 laptopctl ram [status [USER]]
 laptopctl ram set USER RAM_CAP [--high SIZE] [--swap SIZE]
 laptopctl ram boost USER RAM_CAP [--high SIZE] [--swap SIZE] [--for DURATION]
@@ -104,6 +109,19 @@ Saving permanent caps with `ram set` also ends any active boost for that account
 Changes require `sudo`; status does not. Timers and temporary state are kept under systemd and `/run/laptopctl-ram`. Existing caps do not change when you install the extension.
 
 These limits cover the account's login sessions and user services in `user-UID.slice`. System services in `system.slice` need their own limits. Account caps share the host's capacity; raising a cap does not reserve RAM.
+
+## Manage account storage limits
+
+The storage helper requires user quota accounting and enforcement to be enabled on the root filesystem before use. Installing it does not enable quotas or set limits. Filesystems and distributions differ; follow the system's quota setup procedure and verify accounting before setting limits.
+
+```sh
+laptopctl storage status
+laptopctl storage status agrima
+laptopctl storage set agrima 20G
+laptopctl storage remove agrima
+```
+
+The hard limit applies to disk space owned by the user anywhere on the root filesystem. It does not cover separate filesystems. Sizes are whole numbers in MiB, GiB, or TiB, such as `512M`, `20G`, or `1T`. Writes that allocate space fail when the limit is reached. A limit cannot be set below current usage. Removing a limit makes block usage unlimited. These commands preserve existing inode limits, require sudo, and take effect immediately without a reboot. Quotas do not reserve space, so the filesystem can fill before users reach their limits.
 
 ## Platform notes
 
