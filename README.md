@@ -10,6 +10,7 @@ A small Bash command-line tool for checking and controlling common laptop servic
 - Optional: `nmcli` and `tailscale` for network and Tailscale details
 - `sudo` for commands that change system state
 - Python 3 for RAM and storage commands
+- The `quota` package (`repquota` and `setquota`) for storage commands
 - Active Linux user quotas on the root filesystem for storage commands
 
 The status commands read information from systemd, `/proc`, and `/sys`. Control commands use `sudo` to start or stop services, change the default boot target, set backlight power, or terminate a login session. Review the script before running it, especially before using commands that change state.
@@ -78,14 +79,13 @@ Show host memory availability and the current caps for each login account:
 
 ```sh
 laptopctl ram
-laptopctl ram status agrima
+laptopctl ram status USER
 ```
 
 Save permanent caps, using whole sizes such as `512M` or `8G`:
 
 ```sh
-laptopctl ram set agrima 8G --high 6G --swap 2G
-laptopctl ram set ubuntu 22G --high 20G --swap 7G
+laptopctl ram set USER 8G --high 6G --swap 2G
 ```
 
 `RAM_CAP` is the hard RAM limit. `--high` is the threshold for memory reclaim and throttling; it defaults to 90% of the RAM cap. `--swap` keeps the current account swap cap when omitted. Caps must fit within the host's installed RAM and configured swap.
@@ -93,7 +93,7 @@ laptopctl ram set ubuntu 22G --high 20G --swap 7G
 Grant a two-hour increase:
 
 ```sh
-laptopctl ram boost agrima 12G --high 10G --swap 3G --for 2h
+laptopctl ram boost USER 12G --high 10G --swap 3G --for 2h
 ```
 
 A systemd timer restores the previous caps even if you close your terminal. Durations accept seconds, minutes, hours, or days, such as `30s`, `30m`, `2h`, or `1d`. Without `--for`, the increase lasts one hour. Reboot clears temporary changes and restores the saved limits. A second boost replaces the previous deadline and retains the original restoration values.
@@ -101,7 +101,7 @@ A systemd timer restores the previous caps even if you close your terminal. Dura
 End the increase early:
 
 ```sh
-laptopctl ram restore agrima
+laptopctl ram restore USER
 ```
 
 Saving permanent caps with `ram set` also ends any active boost for that account. The tool rejects caps below current memory use unless you pass `--force`, because lowering a hard cap can terminate processes. Check usage before restoring a lower limit, including before a timed increase expires.
@@ -116,12 +116,12 @@ The storage helper requires user quota accounting and enforcement to be enabled 
 
 ```sh
 laptopctl storage status
-laptopctl storage status agrima
-laptopctl storage set agrima 20G
-laptopctl storage remove agrima
+laptopctl storage status USER
+laptopctl storage set USER 20G
+laptopctl storage remove USER
 ```
 
-The hard limit applies to disk space owned by the user anywhere on the root filesystem. It does not cover separate filesystems. Sizes are whole numbers in MiB, GiB, or TiB, such as `512M`, `20G`, or `1T`. Writes that allocate space fail when the limit is reached. A limit cannot be set below current usage. Removing a limit makes block usage unlimited. These commands preserve existing inode limits, require sudo, and take effect immediately without a reboot. Quotas do not reserve space, so the filesystem can fill before users reach their limits.
+The hard limit applies to disk space owned by the user anywhere on the root filesystem. It does not cover separate filesystems. Sizes are whole numbers in MiB, GiB, or TiB, such as `512M`, `20G`, or `1T`. Writes that allocate space fail when the limit is reached. A limit cannot be set below current usage. Removing a limit makes block usage unlimited. These commands preserve existing inode limits, require sudo, and take effect immediately without a reboot. Avoid changing the same user’s quota concurrently with another tool: `setquota` requires the helper to read and then write the inode limits as well. Quotas do not reserve space, so the filesystem can fill before users reach their limits.
 
 ## Platform notes
 

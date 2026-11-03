@@ -1,22 +1,47 @@
 #!/usr/bin/env python3
 import argparse
-import ctypes
+import csv
+import io
 import os
 import pwd
 import re
 import subprocess
 import sys
 
-class Quota(ctypes.Structure):
-    _fields_ = [(n, ctypes.c_uint64) for n in ('hard', 'soft', 'used', 'ihard', 'isoft', 'iused', 'btime', 'itime')] + [('valid', ctypes.c_uint32)]
 
-libc = ctypes.CDLL(None, use_errno=True)
-libc.quotactl.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+class StorageError(Exception):
+    pass
 
-def query(command, device, uid, data):
-    if libc.quotactl(ctypes.c_int(command << 8), os.fsencode(device), uid, ctypes.byref(data)) != 0:
-        e = ctypes.get_errno()
-        raise OSError(e, os.strerror(e))
+
+def report():
+    result = subprocess.run(
+        ['repquota', '-u', '-v', '-n', '-p', '-O', 'csv', '/'],
+        text=True, capture_output=True, check=True, env={**os.environ, 'LC_ALL': 'C'},
+    )
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines):
+        fields = next(csv.reader([line]))
+        if 'FileSoftLimit' in fields and 'FileHardLimit' in fields:
+            break
+    else:
+        raise StorageError('cannot interpret repquota CSV output')
+    rows = {}
+    for row in csv.DictReader(io.StringIO('\n'.join(lines[index:]))):
+        name = row.get(fields[0], '').strip()
+        if not re.fullmatch(r'#?\d+', name):
+            raise StorageError(f'unexpected quota record: {name!r}')
+        try:
+            prefix = 'Block' if 'BlockUsed' in row else 'Space'
+            rows[int(name.lstrip('#'))] = {
+                'used': int(row[prefix + 'Used']),
+                'hard': int(row[prefix + 'HardLimit']),
+                'isoft': int(row['FileSoftLimit']),
+                'ihard': int(row['FileHardLimit']),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise StorageError(f'invalid quota record for {name}') from error
+    return rows
+
 
 def main():
     parser = argparse.ArgumentParser(prog='laptopctl storage', description='Manage user disk quotas on the root filesystem.')
@@ -27,34 +52,34 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         os.execvp('sudo', ['sudo', '--', '/usr/local/libexec/laptopctl-storage', *sys.argv[1:]])
-    device = subprocess.check_output(['findmnt', '-n', '-o', 'SOURCE', '--target', '/'], text=True).strip()
     users = [pwd.getpwnam(args.user)] if getattr(args, 'user', None) else [u for u in pwd.getpwall() if 1000 <= u.pw_uid < 60000]
+    quotas = report()
     for user in users:
         if user.pw_uid == 0:
-            raise ValueError('root is exempt from ordinary user quotas')
-        data = Quota()
-        query(0x800007, device, user.pw_uid, data)
+            raise StorageError('root is exempt from ordinary user quotas')
+        data = quotas.get(user.pw_uid, {'used': 0, 'hard': 0, 'isoft': 0, 'ihard': 0})
         if args.action in ('set', 'remove'):
-            if args.action == 'remove':
-                hard = 0
-            else:
+            hard = 0
+            if args.action == 'set':
                 match = re.fullmatch(r'([1-9][0-9]*)([MGT])', args.size.upper())
                 if not match:
-                    raise ValueError('use a positive whole size such as 10G or 512M')
+                    raise StorageError('use a positive whole size such as 10G or 512M')
                 hard = int(match[1]) * {'M': 1024, 'G': 1024**2, 'T': 1024**3}[match[2]]
                 if hard >= 2**64:
-                    raise ValueError('size is too large')
-            if hard and hard * 1024 < data.used:
-                raise ValueError(f'{user.pw_name} already uses {data.used / 1024**3:.2f} GiB; refusing a lower limit')
-            data.hard, data.soft, data.valid = hard, 0, 1
-            query(0x800008, device, user.pw_uid, data)
-            query(0x800007, device, user.pw_uid, data)
-        limit = f'{data.hard / 1024**2:.2f} GiB' if data.hard else 'unlimited'
-        print(f'{user.pw_name:16} {data.used / 1024**3:9.2f} GiB used   limit {limit}')
+                    raise StorageError('size is too large')
+            if hard and hard < data['used']:
+                raise StorageError(f"{user.pw_name} already uses {data['used'] / 1024**2:.2f} GiB; refusing a lower limit")
+            subprocess.run(['setquota', '-u', str(user.pw_uid), '0', str(hard),
+                            str(data['isoft']), str(data['ihard']), '/'], check=True)
+            data = report().get(user.pw_uid, {'used': 0, 'hard': 0})
+        limit = f"{data['hard'] / 1024**2:.2f} GiB" if data['hard'] else 'unlimited'
+        print(f"{user.pw_name:16} {data['used'] / 1024**2:9.2f} GiB used   limit {limit}")
+
 
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, KeyError, ValueError, subprocess.CalledProcessError) as e:
-        print(f'laptopctl storage: {e}. Check that user quotas are enabled on /.', file=sys.stderr)
+    except (OSError, KeyError, StorageError, subprocess.CalledProcessError) as error:
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        print(f'laptopctl storage: {detail}', file=sys.stderr)
         sys.exit(1)

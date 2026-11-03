@@ -254,7 +254,7 @@ Examples:
   laptopctl s -x
   laptopctl k 5
   laptopctl ram
-  laptopctl ram boost agrima 12G --for 2h
+  laptopctl ram boost USER 12G --for 2h
 
 Alias:
   lstat        Same as laptopctl status
