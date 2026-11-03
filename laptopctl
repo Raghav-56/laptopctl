@@ -235,6 +235,10 @@ Usage:
   laptopctl b|boot {gui|headless|status}
   laptopctl s|sessions [-x|--exclude-xrdp]
   laptopctl k|kill SESSION_ID
+  laptopctl ram [status [USER]]
+  laptopctl ram set USER RAM_CAP [--high SIZE] [--swap SIZE]
+  laptopctl ram boost USER RAM_CAP [--high SIZE] [--swap SIZE] [--for 2h]
+  laptopctl ram restore USER
 
 Status options:
   status       Show the concise machine status (default)
@@ -246,6 +250,8 @@ Examples:
   laptopctl r on
   laptopctl s -x
   laptopctl k 5
+  laptopctl ram
+  laptopctl ram boost agrima 12G --for 2h
 
 Alias:
   lstat        Same as laptopctl status
@@ -274,6 +280,15 @@ run_action() {
 }
 
 case "${1:-status}" in
+    ram|memory)
+        shift
+        if [ ! -x /usr/local/libexec/laptopctl-ram ]; then
+            printf 'RAM helper is not installed. See the README install commands.\n' >&2
+            exit 1
+        fi
+        exec /usr/local/libexec/laptopctl-ram "$@"
+        ;;
+
     status)
         case "${2:-}" in
             "") show_status ;;

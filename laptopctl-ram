@@ -1,0 +1,301 @@
+#!/usr/bin/python3
+"""Account memory caps for laptopctl on systemd with cgroup v2."""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+INSTALL_PATH = Path('/usr/local/libexec/laptopctl-ram')
+STATE_DIR = Path('/run/laptopctl-ram')
+LIMITS = ('MemoryHigh', 'MemoryMax', 'MemorySwapMax')
+
+
+class RamError(Exception):
+    pass
+
+
+def command(*args):
+    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RamError(result.stderr.strip() or f'{args[0]} exited with status {result.returncode}')
+    return result.stdout.strip()
+
+
+def memory_info():
+    values = {}
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        key, value = line.split(':', 1)
+        values[key] = int(value.split()[0]) * 1024
+    return values
+
+
+def size(value):
+    match = re.fullmatch(r'([0-9]+)([KMGT]?)(?:i?B)?', value, re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError('use a whole size such as 512M, 8G, or 0')
+    return int(match[1]) * 1024 ** ('KMGT'.find(match[2].upper()) + 1 if match[2] else 0)
+
+
+def duration(value):
+    match = re.fullmatch(r'([1-9][0-9]*)([smhd])', value)
+    if not match:
+        raise argparse.ArgumentTypeError('use a duration such as 30m, 2h, or 1d')
+    return int(match[1]) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]]
+
+
+def human(value):
+    if value in ('infinity', 'max'):
+        return 'unlimited'
+    if value in (None, '[not set]'):
+        return '-'
+    count = int(value)
+    for suffix in ('B', 'K', 'M', 'G', 'T'):
+        if count < 1024 or suffix == 'T':
+            return f'{count:.1f}{suffix}' if isinstance(count, float) else f'{count}{suffix}'
+        count /= 1024
+
+
+def is_login_account(account):
+    return 1000 <= account.pw_uid < 65534 and Path(account.pw_shell).name not in ('nologin', 'false')
+
+
+def account_named(name):
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        raise RamError(f'unknown account: {name}') from None
+    if not is_login_account(account):
+        raise RamError('RAM commands manage login accounts with UIDs from 1000 to 65533 and an enabled shell')
+    return account
+
+
+def slice_name(uid):
+    return f'user-{uid}.slice'
+
+
+def properties(uid):
+    text = command('systemctl', 'show', slice_name(uid),
+                   '-p', 'MemoryCurrent', '-p', 'MemorySwapCurrent',
+                   '-p', 'MemoryHigh', '-p', 'MemoryMax', '-p', 'MemorySwapMax')
+    values = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+    if not all(key in values for key in LIMITS):
+        raise RamError(f'cannot read memory controls for {slice_name(uid)}')
+    return values
+
+
+def apply(uid, values, runtime):
+    args = ['systemctl', 'set-property']
+    if runtime:
+        args.append('--runtime')
+    command(*args, slice_name(uid), *(f'{key}={values[key]}' for key in LIMITS))
+
+
+def runtime_override(uid):
+    return Path('/run/systemd/system.control') / f'{slice_name(uid)}.d' / '90-laptopctl-ram.conf'
+
+
+def apply_boost(uid, values):
+    path = runtime_override(uid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[Slice]\n' + ''.join(f'{key}={values[key]}\n' for key in LIMITS))
+    os.chmod(path, 0o644)
+    command('systemctl', 'daemon-reload')
+    apply(uid, values, runtime=True)
+
+
+def state_file(uid):
+    return STATE_DIR / f'{uid}.json'
+
+
+def read_state(uid):
+    try:
+        return json.loads(state_file(uid).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def write_state(uid, state):
+    with tempfile.NamedTemporaryFile(mode='w', dir=STATE_DIR, delete=False) as stream:
+        temporary = Path(stream.name)
+        json.dump(state, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+        os.fchmod(stream.fileno(), 0o644)
+    try:
+        temporary.replace(state_file(uid))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def locked():
+    STATE_DIR.mkdir(mode=0o755, exist_ok=True)
+    info = STATE_DIR.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        raise RamError(f'{STATE_DIR} must be owned by root and writable only by root')
+    with (STATE_DIR / '.lock').open('a') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def stop_timer(state):
+    for suffix in ('.timer', '.service'):
+        unit = state['timer'] + suffix
+        loaded = command('systemctl', 'show', unit, '-p', 'LoadState', '--value')
+        if loaded != 'not-found':
+            command('systemctl', 'stop', unit)
+
+
+def restore(uid, token=None):
+    state = read_state(uid)
+    if state is None or token is not None and state['token'] != token:
+        return False
+    if token is None:
+        stop_timer(state)
+    runtime_override(uid).unlink(missing_ok=True)
+    command('systemctl', 'daemon-reload')
+    apply(uid, state['baseline'], runtime=True)
+    state_file(uid).unlink()
+    return True
+
+
+def validate_limits(args, current):
+    info = memory_info()
+    maximum = args.maximum
+    high = args.high if args.high is not None else maximum * 9 // 10
+    swap = args.swap if args.swap is not None else current['MemorySwapMax']
+    if swap == 'infinity':
+        swap = info['SwapTotal']
+    swap = int(swap)
+    if not 0 < high <= maximum <= info['MemTotal']:
+        raise RamError('require 0 < high <= RAM cap <= installed RAM')
+    if not 0 <= swap <= info['SwapTotal']:
+        raise RamError('swap cap must be between 0 and the available system swap size')
+    usage = current.get('MemoryCurrent', '[not set]')
+    if usage != '[not set]' and int(usage) > maximum and not args.force:
+        raise RamError('current usage exceeds that cap; finish the job first or use --force to allow process termination')
+    return dict(zip(LIMITS, (high, maximum, swap)))
+
+
+def change(args):
+    account = account_named(args.user)
+    uid = account.pw_uid
+    current = properties(uid)
+    values = validate_limits(args, current)
+    old_state = read_state(uid)
+    baseline = old_state['baseline'] if old_state else {key: current[key] for key in LIMITS}
+    if args.action == 'set':
+        if old_state:
+            restore(uid)
+        apply(uid, values, runtime=False)
+        print(f'Saved caps for {account.pw_name}. They persist after reboot.')
+        return
+    if old_state:
+        stop_timer(old_state)
+    token = uuid.uuid4().hex
+    state = {'user': account.pw_name, 'uid': uid, 'token': token,
+             'timer': f'laptopctl-ram-{uid}-{token[:8]}', 'baseline': baseline,
+             'expires': time.time() + args.duration, 'boost': values}
+    write_state(uid, state)
+    try:
+        command('systemd-run', '--quiet', '--collect', f'--unit={state["timer"]}',
+                f'--on-active={args.duration}s', '--timer-property=AccuracySec=1s',
+                '--timer-property=RemainAfterElapse=no', str(INSTALL_PATH),
+                '_expire', str(uid), token)
+        apply_boost(uid, values)
+    except (RamError, OSError):
+        stop_timer(state)
+        runtime_override(uid).unlink(missing_ok=True)
+        command('systemctl', 'daemon-reload')
+        apply(uid, baseline, runtime=True)
+        state_file(uid).unlink(missing_ok=True)
+        raise
+    seconds = args.duration
+    wait = f'{seconds // 3600}h {seconds % 3600 // 60}m {seconds % 60}s'
+    print(f'Temporary caps for {account.pw_name}; previous limits restore in {wait}.'
+          ' Reboot also clears this increase.')
+
+
+def show(user=None):
+    info = memory_info()
+    print(f'Host RAM available: {human(info["MemAvailable"])} / {human(info["MemTotal"])}; '
+          f'swap used: {human(info["SwapTotal"] - info["SwapFree"])} / {human(info["SwapTotal"])}')
+    print(f'{"USER":<14} {"USED":>8} {"HIGH":>10} {"RAM CAP":>10} {"SWAP USED/CAP":>18}  TEMPORARY')
+    accounts = [account_named(user)] if user else sorted(
+        (account for account in pwd.getpwall() if is_login_account(account)),
+        key=lambda account: account.pw_uid)
+    for account in accounts:
+        values = properties(account.pw_uid)
+        state = read_state(account.pw_uid)
+        remaining = max(0, int(state['expires'] - time.time())) if state else None
+        temporary = (f'{remaining // 3600}h {(remaining % 3600) // 60}m left' if remaining else 'restore due') if state else '-'
+        swap = f'{human(values.get("MemorySwapCurrent"))}/{human(values["MemorySwapMax"])}'
+        print(f'{account.pw_name:<14} {human(values.get("MemoryCurrent")):>8} '
+              f'{human(values["MemoryHigh"]):>10} {human(values["MemoryMax"]):>10} {swap:>18}  {temporary}')
+
+
+def parser():
+    result = argparse.ArgumentParser(prog='laptopctl ram', description='View and manage account RAM caps.')
+    actions = result.add_subparsers(dest='action')
+    status = actions.add_parser('status', aliases=['show'], help='show all login accounts or one account')
+    status.add_argument('user', nargs='?')
+    for action, help_text in (('set', 'save permanent caps'), ('boost', 'temporarily change caps with automatic restoration')):
+        sub = actions.add_parser(action, help=help_text)
+        sub.add_argument('user')
+        sub.add_argument('maximum', type=size, metavar='RAM_CAP', help='for example 8G or 12G')
+        sub.add_argument('--high', type=size, help='throttle above this amount; default is 90%% of RAM cap')
+        sub.add_argument('--swap', type=size, help='swap cap; default keeps the current swap cap')
+        sub.add_argument('--force', action='store_true', help='allow lowering the cap below current usage')
+        if action == 'boost':
+            sub.add_argument('--for', dest='duration', type=duration, default=3600, metavar='DURATION', help='30m, 2h, or 1d; default 1h')
+    reset = actions.add_parser('restore', help='end a temporary change and restore the previous caps')
+    reset.add_argument('user')
+    return result
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        if argv and argv[0] == '_expire':
+            if os.geteuid() != 0 or len(argv) != 3 or not argv[1].isdigit() or not re.fullmatch('[0-9a-f]{32}', argv[2]):
+                raise RamError('invalid expiration request')
+            with locked():
+                restore(int(argv[1]), argv[2])
+            return 0
+        args = parser().parse_args(argv)
+        if args.action in (None, 'status', 'show'):
+            show(getattr(args, 'user', None))
+            return 0
+        account_named(args.user)
+        if os.geteuid() != 0:
+            if Path(__file__).resolve() != INSTALL_PATH:
+                raise RamError(f'install the RAM helper at {INSTALL_PATH} before changing limits')
+            os.execvp('sudo', ['sudo', '--', str(INSTALL_PATH), *argv])
+        with locked():
+            if args.action == 'restore':
+                uid = account_named(args.user).pw_uid
+                if not restore(uid):
+                    raise RamError(f'{args.user} has no temporary change to restore')
+                print(f'Restored previous caps for {args.user}.')
+            else:
+                change(args)
+        show(args.user)
+        return 0
+    except (RamError, OSError, ValueError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
