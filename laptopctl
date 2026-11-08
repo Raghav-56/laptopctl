@@ -4,6 +4,63 @@ svc_state() {
     systemctl is-active "$1" 2>/dev/null || true
 }
 
+rdp_backend() {
+    case "${LAPTOPCTL_RDP_BACKEND:-auto}" in
+        krdp|xrdp) printf '%s\n' "$LAPTOPCTL_RDP_BACKEND" ;;
+        auto)
+            if systemctl --user is-enabled --quiet app-org.kde.krdpserver.service 2>/dev/null ||
+               systemctl --user is-active --quiet app-org.kde.krdpserver.service 2>/dev/null; then
+                echo krdp
+            else
+                echo xrdp
+            fi
+            ;;
+        *) printf 'Invalid LAPTOPCTL_RDP_BACKEND: use auto, krdp, or xrdp.\n' >&2; return 2 ;;
+    esac
+}
+
+gui_summary() {
+    local manager
+    manager=$(systemctl show display-manager.service -p Id --value 2>/dev/null)
+    printf '%s=%s\n' "${manager:-display-manager.service}" "$(svc_state display-manager.service)"
+}
+
+rdp_summary() {
+    local backend
+    backend=$(rdp_backend) || return
+    if [ "$backend" = krdp ]; then
+        printf 'KRdp (user)=%s\n' "$(systemctl --user is-active app-org.kde.krdpserver.service 2>/dev/null || true)"
+    else
+        printf 'xrdp=%s, sesman=%s\n' "$(svc_state xrdp)" "$(svc_state xrdp-sesman)"
+    fi
+}
+
+rdp_change() {
+    local backend
+    backend=$(rdp_backend) || return
+    if [ "$backend" = krdp ]; then
+        if [ "$1" = start ] && ! systemctl --user is-active --quiet plasma-core.target; then
+            printf 'KDE is not running. Start it with laptopctl gui on first.\n' >&2
+            return 1
+        fi
+        systemctl --user "$1" app-org.kde.krdpserver.service
+    elif [ "$1" = start ]; then
+        sudo systemctl start xrdp-sesman xrdp
+    else
+        sudo systemctl stop xrdp xrdp-sesman
+    fi
+}
+
+rdp_status() {
+    local backend
+    backend=$(rdp_backend) || return
+    if [ "$backend" = krdp ]; then
+        systemctl --user status app-org.kde.krdpserver.service --no-pager
+    else
+        systemctl status xrdp xrdp-sesman --no-pager
+    fi
+}
+
 battery_status() {
     found=0
     for battery in /sys/class/power_supply/*; do
@@ -82,19 +139,17 @@ thermal_status() {
 
 show_all_status() {
     echo "=== GUI ==="
-    printf "LightDM:      %s\n" "$(svc_state lightdm)"
+    printf "Desktop:      %s\n" "$(gui_summary)"
     printf "Default boot: %s\n" "$(systemctl get-default)"
 
     echo
     echo "=== RDP ==="
-    printf "xrdp:         %s\n" "$(svc_state xrdp)"
-    printf "xrdp-sesman:  %s\n" "$(svc_state xrdp-sesman)"
+    rdp_summary
 
     echo
-    echo "RDP/Xfce processes:"
-    ps -eo pid,user,cmd |
-        grep -E 'Xorg.*xrdp|xrdp-chansrv|xfce4-session' |
-        grep -v grep || echo "none"
+    echo "Desktop/RDP processes:"
+    ps -eo pid,user,comm |
+        awk 'NR == 1 || $3 ~ /^(Xorg|xrdp|xrdp-sesman|xrdp-chansrv|xfce4-session|startplasma-way|kwin_wayland|plasmashell|krdpserver)$/'
 
     echo
     echo "=== Lid ==="
@@ -159,9 +214,8 @@ show_all_status() {
 
 show_status() {
     printf "Boot:      %s\n" "$(systemctl get-default)"
-    printf "GUI:       %s\n" "$(svc_state lightdm)"
-    printf "RDP:       xrdp=%s, sesman=%s\n" \
-        "$(svc_state xrdp)" "$(svc_state xrdp-sesman)"
+    printf "GUI:       %s\n" "$(gui_summary)"
+    printf "RDP:       %s\n" "$(rdp_summary)"
 
     lid=$(cat /proc/acpi/button/lid/*/state 2>/dev/null || echo "unknown")
     printf "Lid:       %s\n" "$lid"
@@ -242,6 +296,11 @@ Usage:
   laptopctl ram set USER RAM_CAP [--high SIZE] [--swap SIZE]
   laptopctl ram boost USER RAM_CAP [--high SIZE] [--swap SIZE] [--for 2h]
   laptopctl ram restore USER
+
+Desktop controls:
+  gui          Controls the configured system display manager (SDDM, LightDM, etc.)
+  rdp          Uses enabled/running user KRdp, otherwise system xrdp
+  LAPTOPCTL_RDP_BACKEND=auto|krdp|xrdp overrides RDP selection
 
 Status options:
   status       Show the concise machine status (default)
@@ -329,15 +388,15 @@ case "${1:-status}" in
         case "${2:-}" in
             on)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui on'
-                run_action 'Starting the graphical desktop' 'Graphical desktop is on.' sudo systemctl start lightdm
+                run_action 'Starting the graphical desktop' 'Graphical desktop is on.' sudo systemctl start display-manager.service
                 ;;
             off)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui off'
-                run_action 'Stopping the graphical desktop' 'Graphical desktop is off.' sudo systemctl stop lightdm
+                run_action 'Stopping the graphical desktop' 'Graphical desktop is off.' sudo systemctl stop display-manager.service
                 ;;
             status)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl gui status'
-                systemctl status lightdm --no-pager
+                systemctl status display-manager.service --no-pager
                 ;;
             --help|-h) show_help ;;
             *) usage_error "unknown GUI action: ${2:-<missing>}" 'laptopctl gui {on|off|status}' ;;
@@ -348,15 +407,15 @@ case "${1:-status}" in
         case "${2:-}" in
             on)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp on'
-                run_action 'Starting the RDP server' 'RDP server is on.' sudo systemctl start xrdp-sesman xrdp
+                run_action 'Starting the RDP server' 'RDP server is on.' rdp_change start
                 ;;
             off)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp off'
-                run_action 'Stopping the RDP server' 'RDP server is off.' sudo systemctl stop xrdp xrdp-sesman
+                run_action 'Stopping the RDP server' 'RDP server is off.' rdp_change stop
                 ;;
             status)
                 [ "$#" -eq 2 ] || usage_error 'too many arguments' 'laptopctl rdp status'
-                systemctl status xrdp xrdp-sesman --no-pager
+                rdp_status
                 ;;
             --help|-h) show_help ;;
             *) usage_error "unknown RDP action: ${2:-<missing>}" 'laptopctl rdp {on|off|status}' ;;

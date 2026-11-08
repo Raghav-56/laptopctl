@@ -1,6 +1,6 @@
 # laptopctl
 
-A small Bash command-line tool for checking and controlling common laptop services and hardware state on systemd-based Linux.
+A small Bash command-line tool for checking and controlling desktop services, remote access, and hardware state on systemd-based Linux laptops and servers.
 
 ## Requirements
 
@@ -13,7 +13,7 @@ A small Bash command-line tool for checking and controlling common laptop servic
 - The `quota` package (`repquota` and `setquota`) for storage commands
 - Active Linux user quotas on the root filesystem for storage commands
 
-The status commands read information from systemd, `/proc`, and `/sys`. Control commands use `sudo` to start or stop services, change the default boot target, set backlight power, or terminate a login session. Review the script before running it, especially before using commands that change state.
+The status commands read information from systemd, `/proc`, and `/sys`. System service and hardware controls use `sudo`; user-level KRdp controls run as the current user. Review the script before running it, especially before using commands that change state.
 
 ## Install
 
@@ -72,6 +72,33 @@ laptopctl ram restore USER
 ```
 
 Short aliases are available for the command groups (`g`, `r`, `bl`, `b`, `s`, and `k`). Run `laptopctl --help` for examples and all options.
+
+## Desktop and remote access
+
+`laptopctl gui` controls the configured `display-manager.service` alias, so it follows the machine's selected display manager, such as SDDM or LightDM. It does not assume a particular desktop or install one. Stopping the display manager ends its desktop session and can lose unsaved work.
+
+`laptopctl rdp` selects an enabled or running user-level `app-org.kde.krdpserver.service` when available. Otherwise it controls the system `xrdp` and `xrdp-sesman` services. Override selection for a command with `LAPTOPCTL_RDP_BACKEND=krdp` or `LAPTOPCTL_RDP_BACKEND=xrdp`; `auto` is the default. KRdp requires an already running KDE session. `rdp off` stops remote access without stopping the desktop; `gui off` stops the desktop itself.
+
+```sh
+laptopctl gui on
+laptopctl rdp status
+laptopctl rdp off
+laptopctl rdp on
+LAPTOPCTL_RDP_BACKEND=xrdp laptopctl rdp status
+```
+
+`laptopctl boot gui` and `boot headless` change the system's default boot target. They do not start or stop the current desktop immediately. A user-only desktop service needs its own lifecycle; it is not controlled by the display-manager alias.
+
+Run the tool on the machine being controlled. For example, `ssh HOST laptopctl status` uses that host's desktop and RDP services. SSH transport and client-side RDP applications remain separate from the local service controller; no remote OS needs to be guessed.
+
+This tool does not configure TLS, credentials, firewall exposure, or Tailscale routing. Restrict the RDP listener appropriately before enabling access. For KRdp, use the systemd user manager and KDE session belonging to the desktop account, rather than running `sudo laptopctl rdp ...`.
+
+Verify changes with:
+
+```sh
+bash -n laptopctl
+python3 -B -m unittest test_desktop.py test_ram.py test_storage.py
+```
 
 ## Manage account RAM caps
 
